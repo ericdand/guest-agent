@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -148,9 +149,19 @@ func (o *osloginMgr) Set(ctx context.Context) error {
 		logger.Errorf("Error updating SSH config: %v.", err)
 	}
 
+	useSssd := sssdNssSocketIsAvailable()
 	logger.Debugf("Updating NSS config...")
-	if err := writeNSSwitchConfig(enable); err != nil {
+	if err := writeNSSwitchConfig(enable, useSssd); err != nil {
 		logger.Errorf("Error updating NSS config: %v.", err)
+	}
+
+	if useSssd {
+		logger.Debugf("Updating SSSD config...")
+		if err := writeSssdConfig(enable); err != nil {
+			logger.Errorf("Error updating SSSD config: %v.", err)
+		}
+	} else {
+		logger.Debugf("SSSD is not available; not editing sssd.conf.")
 	}
 
 	logger.Debugf("Updating PAM config...")
@@ -363,37 +374,61 @@ func writeSSHConfig(enable, twofactor, skey, reqCerts bool) error {
 	return writeConfigFile("/etc/ssh/sshd_config", proposed)
 }
 
-func updateNSSwitchConfig(nsswitch string, enable bool) string {
+func updateNSSwitchConfig(nsswitch string, enable, useSssd bool) string {
 	oslogin := " cache_oslogin oslogin"
-
+	sssd := " sssd"
 	var filtered []string
-	for _, line := range strings.Split(string(nsswitch), "\n") {
-		if strings.HasPrefix(line, "passwd:") || strings.HasPrefix(line, "group:") {
-			present := strings.Contains(line, "oslogin")
-			if enable && !present {
-				line += oslogin
-			} else if !enable && present {
-				line = strings.Replace(line, oslogin, "", 1)
+	if enable {
+		for _, line := range strings.Split(nsswitch, "\n") {
+			if !strings.HasPrefix(line, "passwd:") {
+				filtered = append(filtered, line)
+				continue
 			}
 
 			if runtime.GOOS == "freebsd" {
 				line = strings.Replace(line, "compat", "files", 1)
 			}
+
+			if useSssd && !strings.Contains(line, sssd) {
+				filtered = append(filtered, line+sssd)
+			}
+			if !useSssd && !strings.Contains(line, "oslogin") {
+				filtered = append(filtered, line+oslogin)
+			}
 		}
-		filtered = append(filtered, line)
+	} else {
+		for _, line := range strings.Split(string(nsswitch), "\n") {
+			if !strings.HasPrefix(line, "passwd:") {
+				filtered = append(filtered, line)
+				continue
+			}
+
+			if runtime.GOOS == "freebsd" {
+				line = strings.Replace(line, "compat", "files", 1)
+			}
+
+			if strings.Contains(line, "oslogin") {
+				filtered = append(filtered, strings.Replace(line, oslogin, "", 1))
+			}
+			if strings.Contains(line, sssd) {
+				// TODO should we actually disable SSSD, or only remove OS Login from the SSSD config? Probably just the latter...
+				filtered = append(filtered, strings.Replace(line, sssd, "", 1))
+			}
+		}
 	}
-	// No trailing "\n" here because `filtered` will include an empty element at the end to account for it.
+
+	// No trailing "\n" here because the input nsswitch already has a trailing newline (and so filtered's last element will be the empty string).
 	return strings.Join(filtered, "\n")
 }
 
-func writeNSSwitchConfig(enable bool) error {
+func writeNSSwitchConfig(enable, useSssd bool) error {
 	logger.Debugf("Reading NSSwitch config file...")
 	nsswitch, err := os.ReadFile("/etc/nsswitch.conf")
 	if err != nil {
 		logger.Warningf("Error reading NSSwitch config file: %v", err)
 		return err
 	}
-	proposed := updateNSSwitchConfig(string(nsswitch), enable)
+	proposed := updateNSSwitchConfig(string(nsswitch), enable, useSssd)
 	if proposed == string(nsswitch) {
 		logger.Debugf("NSSwitch config file is as expected. No changes needed.")
 		return nil
@@ -404,6 +439,118 @@ func writeNSSwitchConfig(enable bool) error {
 		logger.Debugf("Editing NSSwitch config file to disable OS Login.")
 	}
 	return writeConfigFile("/etc/nsswitch.conf", proposed)
+}
+
+func sssdNssSocketIsAvailable() bool {
+	// Connection to a Unix socket should usually return immediately, but we set a timeout to
+	// guard against a socket stuck in a "zombie" state, where it might accept a connection
+	// but never finish the handshake.
+	conn, err := net.DialTimeout("unix", "/var/lib/sss/pipes/nss", time.Millisecond*50)
+	if err != nil {
+		logger.Infof("No SSSD socket available: %v", err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func updateSssdConfig(contents string, enable bool) string {
+	var newContents []string
+	if enable {
+		inSssdConfigSection := false
+		sawOsLoginDomainConfig := false
+		for _, line := range strings.Split(contents, "\n") {
+			if strings.HasPrefix(line, "[") {
+				if line == "[sssd]" {
+					inSssdConfigSection = true
+				} else {
+					inSssdConfigSection = false
+				}
+				if line == "[domains/google_oslogin]" {
+					sawOsLoginDomainConfig = true
+				}
+				newContents = append(newContents, line)
+				continue
+			} // else:
+			if inSssdConfigSection {
+				if strings.HasPrefix(line, "services = ") {
+					if strings.Contains(line, "nss") {
+						// NSS already enabled.
+						newContents = append(newContents, line)
+						continue
+					} // else:
+					services := strings.Split(line, ",")
+					services = append(services, "nss")
+					newContents = append(newContents, strings.Join(services, ","))
+					continue
+				} // else:
+				if strings.HasPrefix(line, "domains = ") {
+					if strings.Contains(line, "google_oslogin") {
+						// OS Login domain already set up.
+						newContents = append(newContents, line)
+						continue
+					} // else:
+					domains := strings.Split(line, ",")
+					domains = append(domains, "google_oslogin")
+					newContents = append(newContents, strings.Join(domains, ","))
+					continue
+				} // else:
+			} // else:
+			newContents = append(newContents, line)
+			continue
+		}
+		if !sawOsLoginDomainConfig {
+			newContents = append(newContents, "[domains/google_oslogin]")
+			newContents = append(newContents, "id_provider = proxy")
+			newContents = append(newContents, "proxy_lib_name = google_oslogin")
+			newContents = append(newContents, "entry_cache_timeout = 300")
+			//newContents = append(newContents, "auth_provider = proxy") // This is for PAM only?
+			//newContents = append(newContents, "cache_credentials = true")
+			newContents = append(newContents, "")
+		}
+	} else {
+		inSssdConfigSection := false
+		for _, line := range strings.Split(contents, "\n") {
+			if strings.HasPrefix(line, "[") {
+				if line == "[sssd]" {
+					inSssdConfigSection = true
+				} else {
+					inSssdConfigSection = false
+				}
+				newContents = append(newContents, line)
+				continue
+			}
+			// To disable, delist the OS Login domain. Leave everything else in place.
+			if inSssdConfigSection && strings.HasPrefix(line, "domains = ") {
+				domains := strings.Split(strings.TrimPrefix(line, "domains = "), ",")
+				newDomains := make([]string, len(domains))
+				for _, d := range domains {
+					if d == "google_oslogin" {
+						continue
+					} else {
+						newDomains = append(newDomains, d)
+					}
+				}
+				newContents = append(newContents, "domains = "+strings.Join(newDomains, ","))
+				continue
+			}
+			newContents = append(newContents, line)
+			continue
+		}
+	}
+	return strings.Join(newContents, "\n")
+}
+
+func writeSssdConfig(enable bool) error {
+	logger.Debugf("Reading SSSD config file...")
+	sssd, err := os.ReadFile("/etc/sssd/sssd.conf")
+	if err != nil {
+		logger.Warningf("Error reading SSSD config file: %v", err)
+		return err
+	}
+	newSssdConfig := updateSssdConfig(string(sssd), enable)
+	logger.Debugf("Writing SSSD config file...")
+	return writeConfigFile("/etc/sssd/sssd.conf", newSssdConfig)
 }
 
 func updatePAMsshdPamless(pamsshd string, enable, twofactor bool) string {
