@@ -391,9 +391,10 @@ func updateNSSwitchConfig(nsswitch string, enable, useSssd bool) string {
 
 			if useSssd && !strings.Contains(line, sssd) {
 				filtered = append(filtered, line+sssd)
-			}
-			if !useSssd && !strings.Contains(line, "oslogin") {
+			} else if !useSssd && !strings.Contains(line, "oslogin") {
 				filtered = append(filtered, line+oslogin)
+			} else {
+				filtered = append(filtered, line)
 			}
 		}
 	} else {
@@ -409,10 +410,11 @@ func updateNSSwitchConfig(nsswitch string, enable, useSssd bool) string {
 
 			if strings.Contains(line, "oslogin") {
 				filtered = append(filtered, strings.Replace(line, oslogin, "", 1))
-			}
-			if strings.Contains(line, sssd) {
+			} else if strings.Contains(line, sssd) {
 				// TODO should we actually disable SSSD, or only remove OS Login from the SSSD config? Probably just the latter...
 				filtered = append(filtered, strings.Replace(line, sssd, "", 1))
+			} else {
+				filtered = append(filtered, line)
 			}
 		}
 	}
